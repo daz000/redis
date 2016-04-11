@@ -202,6 +202,7 @@ void replicationFeedSlaves(list *slaves, int dictid, robj **argv, int argc) {
         while((ln = listNext(&li))) {
             redisClient *slave = ln->value;
             if (slave->replstate == REDIS_REPL_WAIT_BGSAVE_START) continue;
+            if (slave->flags & REDIS_FAKESLAVE) continue;
             addReply(slave,selectcmd);
         }
 
@@ -241,6 +242,9 @@ void replicationFeedSlaves(list *slaves, int dictid, robj **argv, int argc) {
     listRewind(server.slaves,&li);
     while((ln = listNext(&li))) {
         redisClient *slave = ln->value;
+
+
+        if (slave->flags & REDIS_FAKESLAVE) continue;
 
         /* Don't feed slaves that are still waiting for BGSAVE to start */
         if (slave->replstate == REDIS_REPL_WAIT_BGSAVE_START) continue;
@@ -400,6 +404,34 @@ int replicationSetupSlaveForFullResync(redisClient *slave, long long offset) {
         }
     }
     return REDIS_OK;
+}
+
+/**
+ * fake slave, just generate replication log
+ */
+void doFakeSync(redisClient *c){
+    char buf[128];
+	int buflen;
+
+    c->flags |= REDIS_SLAVE;
+    c->flags |= REDIS_FAKESLAVE;
+    c->replstate = REDIS_REPL_ONLINE;
+    c->repl_ack_time = server.unixtime;
+    c->repl_put_online_on_ack = 0;
+    listAddNodeTail(server.slaves,c);
+
+    buflen = snprintf(buf,sizeof(buf),"+CONTINUE\r\n");
+    if (write(c->fd,buf,buflen) != buflen) {
+        freeClientAsync(c);
+        redisLog(REDIS_NOTICE,
+            "fake slave request from %s abort", replicationGetSlaveName(c));
+        return;
+    }
+
+    if (listLength(server.slaves) == 1 && server.repl_backlog == NULL)
+        createReplicationBacklog();
+
+    refreshGoodSlavesCount();
 }
 
 /* This function handles the PSYNC command from the point of view of a
@@ -600,7 +632,10 @@ void syncCommand(redisClient *c) {
              * resync. */
             if (master_runid[0] != '?') server.stat_sync_partial_err++;
         }
-    } else {
+    } else if(!strcasecmp(c->argv[0]->ptr,"fsync")){
+    	doFakeSync(c);
+    	return;
+    }else {
         /* If a slave uses SYNC, we are dealing with an old implementation
          * of the replication protocol (like redis-cli --slave). Flag the client
          * so that we don't expect to receive REPLCONF ACK feedbacks. */

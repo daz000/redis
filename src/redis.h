@@ -250,6 +250,9 @@ typedef long long mstime_t; /* millisecond time type. */
 #define REDIS_READONLY (1<<17)    /* Cluster client is in read-only state. */
 #define REDIS_PUBSUB (1<<18)      /* Client is in Pub/Sub mode. */
 
+/*ctrip tag*/
+#define REDIS_FAKESLAVE (1<<31)      /* Client is in Pub/Sub mode. */
+
 /* Client block type (btype field in client structure)
  * if REDIS_BLOCKED flag is set. */
 #define REDIS_BLOCKED_NONE 0    /* Not blocked, no REDIS_BLOCKED flag set. */
