@@ -68,6 +68,9 @@ typedef struct sentinelAddr {
 #define SRI_FORCE_FAILOVER (1<<12)  /* Force failover with master up. */
 #define SRI_SCRIPT_KILL_SENT (1<<13) /* SCRIPT KILL already sent on -BUSY */
 
+//ctrip keeper
+#define SRI_KEEPER  (1<<31)
+
 /* Note: times are in milliseconds. */
 #define SENTINEL_INFO_PERIOD 10000
 #define SENTINEL_PING_PERIOD 1000
@@ -335,7 +338,7 @@ sentinelRedisInstance *sentinelSelectSlave(sentinelRedisInstance *master);
 void sentinelScheduleScriptExecution(char *path, ...);
 void sentinelStartFailover(sentinelRedisInstance *master);
 void sentinelDiscardReplyCallback(redisAsyncContext *c, void *reply, void *privdata);
-int sentinelSendSlaveOf(sentinelRedisInstance *ri, char *host, int port);
+int sentinelSendSlaveOf(sentinelRedisInstance *ri, char *host, int port, sentinelRedisInstance *parent);
 char *sentinelVoteLeader(sentinelRedisInstance *master, uint64_t req_epoch, char *req_runid, uint64_t *leader_epoch);
 void sentinelFlushConfig(void);
 void sentinelGenerateInitialMonitorEvents(void);
@@ -1169,6 +1172,7 @@ void sentinelResetMaster(sentinelRedisInstance *ri, int flags) {
     redisAssert(ri->flags & SRI_MASTER);
     dictRelease(ri->slaves);
     ri->slaves = dictCreate(&instancesDictType,NULL);
+
     if (!(flags & SENTINEL_RESET_NO_SENTINELS)) {
         dictRelease(ri->sentinels);
         ri->sentinels = dictCreate(&instancesDictType,NULL);
@@ -1811,10 +1815,16 @@ void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
 
         /* old versions: slave0:<ip>,<port>,<state>
          * new versions: slave0:ip=127.0.0.1,port=9999,... */
-        if ((ri->flags & SRI_MASTER) &&
-            sdslen(l) >= 7 &&
-            !memcmp(l,"slave",5) && isdigit(l[5]))
-        {
+        if ((ri->flags & (SRI_MASTER | SRI_KEEPER)) && sdslen(l) >= 7
+        		&& !memcmp(l,"slave",5) && isdigit(l[5])){
+
+        	int flag = SRI_SLAVE;
+        	sentinelRedisInstance *dest = ri;
+
+        	if(ri->flags & SRI_KEEPER){
+        		dest = ri->master;
+        	}
+
             char *ip, *port, *end;
 
             if (strstr(l,"ip=") == NULL) {
@@ -1839,9 +1849,9 @@ void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
 
             /* Check if we already have this slave into our table,
              * otherwise add it. */
-            if (sentinelRedisInstanceLookupSlave(ri,ip,atoi(port)) == NULL) {
-                if ((slave = createSentinelRedisInstance(NULL,SRI_SLAVE,ip,
-                            atoi(port), ri->quorum, ri)) != NULL)
+            if (sentinelRedisInstanceLookupSlave(dest,ip,atoi(port)) == NULL) {
+                if ((slave = createSentinelRedisInstance(NULL,flag,ip,
+                            atoi(port), ri->quorum, dest)) != NULL)
                 {
                     sentinelEvent(REDIS_NOTICE,"+slave",slave,"%@");
                     sentinelFlushConfig();
@@ -1859,8 +1869,12 @@ void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
         /* role:<role> */
         if (!memcmp(l,"role:master",11)) role = SRI_MASTER;
         else if (!memcmp(l,"role:slave",10)) role = SRI_SLAVE;
+        else if (!memcmp(l,"role:keeper",10)) {
+        	role = SRI_SLAVE | SRI_KEEPER;
+        	ri->flags |= SRI_KEEPER;
+        }
 
-        if (role == SRI_SLAVE) {
+        if (role & SRI_SLAVE) {
             /* master_host:<host> */
             if (sdslen(l) >= 12 && !memcmp(l,"master_host:",12)) {
                 if (ri->slave_master_host == NULL ||
@@ -1969,7 +1983,7 @@ void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
             {
                 int retval = sentinelSendSlaveOf(ri,
                         ri->master->addr->ip,
-                        ri->master->addr->port);
+                        ri->master->addr->port, ri->master);
                 if (retval == REDIS_OK)
                     sentinelEvent(REDIS_NOTICE,"+convert-to-slave",ri,"%@");
             }
@@ -1992,7 +2006,7 @@ void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
         {
             int retval = sentinelSendSlaveOf(ri,
                     ri->master->addr->ip,
-                    ri->master->addr->port);
+                    ri->master->addr->port, ri->master);
             if (retval == REDIS_OK)
                 sentinelEvent(REDIS_NOTICE,"+fix-slave-config",ri,"%@");
         }
@@ -2427,6 +2441,7 @@ void addReplySentinelRedisInstance(redisClient *c, sentinelRedisInstance *ri) {
     if (ri->flags & SRI_O_DOWN) flags = sdscat(flags,"o_down,");
     if (ri->flags & SRI_MASTER) flags = sdscat(flags,"master,");
     if (ri->flags & SRI_SLAVE) flags = sdscat(flags,"slave,");
+    if (ri->flags & SRI_KEEPER) flags = sdscat(flags,"keeper,");
     if (ri->flags & SRI_SENTINEL) flags = sdscat(flags,"sentinel,");
     if (ri->flags & SRI_DISCONNECTED) flags = sdscat(flags,"disconnected,");
     if (ri->flags & SRI_MASTER_DOWN) flags = sdscat(flags,"master_down,");
@@ -3362,11 +3377,34 @@ char *sentinelGetLeader(sentinelRedisInstance *master, uint64_t epoch) {
  * The command returns REDIS_OK if the SLAVEOF command was accepted for
  * (later) delivery otherwise REDIS_ERR. The command replies are just
  * discarded. */
-int sentinelSendSlaveOf(sentinelRedisInstance *ri, char *host, int port) {
+int sentinelSendSlaveOf(sentinelRedisInstance *ri, char *host, int port, sentinelRedisInstance *parent) {
     char portstr[32];
     int retval;
+    sentinelRedisInstance *keeper = NULL;
+    sentinelRedisInstance *dest = ri;
+    dictIterator *di;
+    dictEntry *de;
+    sds  realAddr = sdsempty();
+
 
     ll2string(portstr,sizeof(portstr),port);
+
+    if(parent != NULL){
+
+        di = dictGetIterator(parent->slaves);
+        while((de = dictNext(di)) != NULL) {
+            sentinelRedisInstance *ri = dictGetVal(de);
+            if(ri->flags & SRI_KEEPER){
+            	keeper = ri;
+            	break;
+            }
+        }
+    }
+
+    if(keeper != NULL){
+    	dest = keeper;
+    	realAddr = sdscatprintf(realAddr, "%s:%d", ri->addr->ip, ri->addr->port);
+    }
 
     /* If host is NULL we send SLAVEOF NO ONE that will turn the instance
      * into a master. */
@@ -3374,6 +3412,7 @@ int sentinelSendSlaveOf(sentinelRedisInstance *ri, char *host, int port) {
         host = "NO";
         memcpy(portstr,"ONE",4);
     }
+
 
     /* In order to send SLAVEOF in a safe way, we send a transaction performing
      * the following tasks:
@@ -3385,35 +3424,35 @@ int sentinelSendSlaveOf(sentinelRedisInstance *ri, char *host, int port) {
      *
      * Note that we don't check the replies returned by commands, since we
      * will observe instead the effects in the next INFO output. */
-    retval = redisAsyncCommand(ri->cc,
+    retval = redisAsyncCommand(dest->cc,
         sentinelDiscardReplyCallback, NULL, "MULTI");
     if (retval == REDIS_ERR) return retval;
-    ri->pending_commands++;
+    dest->pending_commands++;
 
-    retval = redisAsyncCommand(ri->cc,
-        sentinelDiscardReplyCallback, NULL, "SLAVEOF %s %s", host, portstr);
+    retval = redisAsyncCommand(dest->cc,
+        sentinelDiscardReplyCallback, NULL, "SLAVEOF %s %s %s", host, portstr, realAddr);
     if (retval == REDIS_ERR) return retval;
-    ri->pending_commands++;
+    dest->pending_commands++;
 
-    retval = redisAsyncCommand(ri->cc,
+    retval = redisAsyncCommand(dest->cc,
         sentinelDiscardReplyCallback, NULL, "CONFIG REWRITE");
     if (retval == REDIS_ERR) return retval;
-    ri->pending_commands++;
+    dest->pending_commands++;
 
     /* CLIENT KILL TYPE <type> is only supported starting from Redis 2.8.12,
      * however sending it to an instance not understanding this command is not
      * an issue because CLIENT is variadic command, so Redis will not
      * recognized as a syntax error, and the transaction will not fail (but
      * only the unsupported command will fail). */
-    retval = redisAsyncCommand(ri->cc,
+    retval = redisAsyncCommand(dest->cc,
         sentinelDiscardReplyCallback, NULL, "CLIENT KILL TYPE normal");
     if (retval == REDIS_ERR) return retval;
-    ri->pending_commands++;
+    dest->pending_commands++;
 
-    retval = redisAsyncCommand(ri->cc,
+    retval = redisAsyncCommand(dest->cc,
         sentinelDiscardReplyCallback, NULL, "EXEC");
     if (retval == REDIS_ERR) return retval;
-    ri->pending_commands++;
+    dest->pending_commands++;
 
     return REDIS_OK;
 }
@@ -3645,7 +3684,7 @@ void sentinelFailoverSendSlaveOfNoOne(sentinelRedisInstance *ri) {
      * We actually register a generic callback for this command as we don't
      * really care about the reply. We check if it worked indirectly observing
      * if INFO returns a different role (master instead of slave). */
-    retval = sentinelSendSlaveOf(ri->promoted_slave,NULL,0);
+    retval = sentinelSendSlaveOf(ri->promoted_slave,NULL,0, ri);
     if (retval != REDIS_OK) return;
     sentinelEvent(REDIS_NOTICE, "+failover-state-wait-promotion",
         ri->promoted_slave,"%@");
@@ -3717,7 +3756,7 @@ void sentinelFailoverDetectEnd(sentinelRedisInstance *master) {
 
             retval = sentinelSendSlaveOf(slave,
                     master->promoted_slave->addr->ip,
-                    master->promoted_slave->addr->port);
+                    master->promoted_slave->addr->port, master);
             if (retval == REDIS_OK) {
                 sentinelEvent(REDIS_NOTICE,"+slave-reconf-sent-be",slave,"%@");
                 slave->flags |= SRI_RECONF_SENT;
@@ -3774,7 +3813,7 @@ void sentinelFailoverReconfNextSlave(sentinelRedisInstance *master) {
         /* Send SLAVEOF <new master>. */
         retval = sentinelSendSlaveOf(slave,
                 master->promoted_slave->addr->ip,
-                master->promoted_slave->addr->port);
+                master->promoted_slave->addr->port, master);
         if (retval == REDIS_OK) {
             slave->flags |= SRI_RECONF_SENT;
             slave->slave_reconf_sent_time = mstime();
